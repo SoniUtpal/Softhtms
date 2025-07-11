@@ -1,0 +1,508 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using AForge.Video;
+using AForge.Video.DirectShow;
+using Microsoft.Data.SqlClient;
+using System.IO;
+using OpenCvSharp;
+using OpenCvSharp.Extensions;
+using OpenCvSharp.Face;
+using System.Speech.Synthesis;
+
+
+namespace Kazinga_Attendance
+{
+    public partial class Form1 : Form
+    {
+        // ───────────────────────────────────────────────
+        //  ▶ Class‑level fields
+        // ───────────────────────────────────────────────
+        private VideoCaptureDevice? videoCapture;
+
+        private FilterInfoCollection? filterInfo;
+
+        private CascadeClassifier faceDetector;
+        private readonly SpeechSynthesizer synthesizer = new();
+        private readonly object speechLock = new();
+        private bool isSpeaking = false;
+        // Face recognition helpers
+        private LBPHFaceRecognizer recognizer;
+        private readonly Dictionary<int, string> labelToEmpId = new();
+        private System.Windows.Forms.Timer attendanceTimer;
+        private bool isPunchingInProgress = false;
+        private string lastEmpId = "";
+
+        // Database connection string – centralise in one place
+        private const string ConnStr = "Data Source=HRM-Server;Initial Catalog=Kazinga_HRMS;Persist Security Info=True;User ID=ou;Password=Outlet_Admin;Encrypt=False";
+
+        // ───────────────────────────────────────────────
+        //  ▶ Constructor
+        // ───────────────────────────────────────────────
+        public Form1()
+        {
+            InitializeComponent();
+            this.HandleCreated += (s, e) =>
+            {
+
+            };
+            textBox2.TextChanged += TextBox2_TextChanged;
+
+            attendanceTimer = new System.Windows.Forms.Timer();
+            attendanceTimer.Interval = 3000; // 5 seconds
+            attendanceTimer.Tick += AttendanceTimer_Tick;
+            // Initialise the Haar cascade for face detection
+            string faceCascadePath = Path.Combine(Application.StartupPath, "haarcascade_frontalface_default.xml");
+            faceDetector = new CascadeClassifier(faceCascadePath);
+
+            // Create recogniser and train once at startup
+            recognizer = LBPHFaceRecognizer.Create();
+            LoadFacesFromDB();
+        }
+
+        // ───────────────────────────────────────────────
+        //  ▶ Camera handling
+        // ───────────────────────────────────────────────
+        // Put this anywhere inside your Form1 class (e.g., just below constructor)
+        private void AttendanceTimer_Tick(object? sender, EventArgs e)
+        {
+            attendanceTimer.Stop();
+
+            if (isPunchingInProgress) return;
+
+            string empId = lastEmpId;
+
+            if (string.IsNullOrEmpty(empId)) return;
+
+            if (pictureBox1.Image == null)
+            {
+                ShowToast("No camera image available for attendance.");
+                return;
+            }
+
+            isPunchingInProgress = true;
+
+            Bitmap bmpToSave = (Bitmap)pictureBox1.Image.Clone();
+
+            Task.Run(() =>
+            {
+                SaveAttendance(empId, bmpToSave);
+
+                this.BeginInvoke(() =>
+                {
+                    isPunchingInProgress = false;
+                    ShowToast($"Attendance punched for {empId}");
+                });
+            });
+        }
+
+
+        private void ShowToast(string message, int durationMs = 3000)
+        {
+            if (!this.IsHandleCreated)
+            {
+                // If handle not created yet, delay the call until form is loaded
+                this.HandleCreated += (s, e) => ShowToast(message, durationMs);
+                return;
+            }
+
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(() => ShowToast(message, durationMs)));
+                return;
+            }
+            Form toast = new Form
+            {
+                FormBorderStyle = FormBorderStyle.None,
+                StartPosition = FormStartPosition.Manual,
+                Size = new System.Drawing.Size(300, 50),
+                BackColor = Color.Black,
+                Opacity = 0.9,
+                ShowInTaskbar = false,
+                TopMost = true
+            };
+
+            Label lbl = new Label
+            {
+                Text = message,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleCenter,
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                BackColor = Color.Transparent
+            };
+
+            toast.Controls.Add(lbl);
+
+            System.Drawing.Rectangle screen = Screen.FromControl(this).WorkingArea;
+            toast.Location = new System.Drawing.Point(screen.Right - toast.Width - 10, screen.Bottom - toast.Height - 10);
+
+            System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+            timer.Interval = durationMs;
+            timer.Tick += (s, e) =>
+            {
+                timer.Stop();
+                toast.Close();
+                toast.Dispose();
+                timer.Dispose();
+            };
+
+            toast.Shown += (s, e) => timer.Start();
+            toast.Show(this);
+
+            // Play the voice message asynchronously
+            Task.Run(() =>
+            {
+                lock (speechLock)
+                {
+                    if (isSpeaking) return; // Prevent overlapping messages
+                    isSpeaking = true;
+
+                    try
+                    {
+                        synthesizer.Volume = 100;
+                        synthesizer.Rate = 0;
+                        synthesizer.Speak(message);
+                    }
+                    finally
+                    {
+                        isSpeaking = false;
+                    }
+                }
+            });
+
+        }
+
+        private void StartCamera()
+        {
+            filterInfo = new FilterInfoCollection(FilterCategory.VideoInputDevice);
+            if (filterInfo.Count == 0)
+            {
+                MessageBox.Show("No camera found.");
+                return;
+            }
+
+            videoCapture = new VideoCaptureDevice(filterInfo[0].MonikerString);
+            videoCapture.NewFrame += Camera_on;
+            videoCapture.Start();
+        }
+        private void SafeInvoke(Action action)
+        {
+            if (!this.IsHandleCreated)
+            {
+                this.HandleCreated += (s, e) => SafeInvoke(action);
+                return;
+            }
+
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(action);
+            }
+            else
+            {
+                action();
+            }
+        }
+
+        private void Camera_on(object sender, NewFrameEventArgs eventArgs)
+        {
+            using Bitmap frameBmp = (Bitmap)eventArgs.Frame.Clone();
+
+            Mat colorMat = BitmapConverter.ToMat(frameBmp);      // color image
+            Mat grayMat = new();
+            Cv2.CvtColor(colorMat, grayMat, ColorConversionCodes.BGR2GRAY);
+
+            var faces = faceDetector.DetectMultiScale(grayMat, 1.2, 5);
+
+            // We'll store the recognized ID for the first face found (or empty)
+            string recognizedEmpId = "";
+
+            foreach (var rc in faces)
+            {
+                int side = Math.Max(rc.Width, rc.Height);
+                int cx = rc.X + rc.Width / 2;
+                int cy = rc.Y + rc.Height / 2;
+                int x = Math.Max(0, cx - side / 2);
+                int y = Math.Max(0, cy - side / 2);
+
+                if (x + side > colorMat.Width) side = colorMat.Width - x;
+                if (y + side > colorMat.Height) side = colorMat.Height - y;
+
+                // Extract face ROI (Region Of Interest)
+                Rect faceRect = new Rect(x, y, side, side);
+                Mat faceROI = new Mat(grayMat, faceRect);
+
+                // 🔑 NORMALISE SIZE — same as in LoadFacesFromDB
+                Cv2.Resize(faceROI, faceROI, new OpenCvSharp.Size(200, 200));
+
+                // Predict face ID and confidence
+                recognizer.Predict(faceROI, out int label, out double confidence);
+
+                string textToShow = "Unknown";
+
+                if (labelToEmpId.ContainsKey(label) && confidence < 60) // confidence threshold
+                {
+                    recognizedEmpId = labelToEmpId[label];
+                    textToShow = $"ID: {recognizedEmpId}";
+                }
+
+                // Draw rectangle and label on the colorMat
+                Cv2.Rectangle(colorMat,
+                    new OpenCvSharp.Point(x, y),
+                    new OpenCvSharp.Point(x + side, y + side),
+                    Scalar.LimeGreen,
+                    2);
+
+                Cv2.PutText(colorMat,
+                    textToShow,
+                    new OpenCvSharp.Point(x, y - 10),
+                    HersheyFonts.HersheyComplex,
+                    1,
+                    Scalar.LimeGreen,
+                    2);
+
+                faceROI.Dispose();
+            }
+
+            Bitmap resultBmp = BitmapConverter.ToBitmap(colorMat);
+
+            SafeInvoke(() =>
+            {
+                pictureBox1.Image?.Dispose();
+                pictureBox1.Image = resultBmp;
+
+                if (!string.IsNullOrEmpty(recognizedEmpId))
+                    textBox2.Text = recognizedEmpId;
+                else
+                    textBox2.Text = "";
+            });
+
+
+            grayMat.Dispose();
+            colorMat.Dispose();
+        }
+
+        // ───────────────────────────────────────────────
+        //  ▶ Form load – could also put logic in ctor
+        // ───────────────────────────────────────────────
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            StartCamera();
+
+            // if (pictureBox1.Image == null)
+            //{
+            //   ShowToast("No frame captured yet.");
+            //  return;
+            //}
+
+
+            /* reserved */
+        }
+
+        // ───────────────────────────────────────────────
+        //  ▶ Train recogniser with faces from DB
+        // ───────────────────────────────────────────────
+        private void LoadFacesFromDB()
+        {
+            
+            var mats = new List<Mat>();
+            var labels = new List<int>();
+            int nextLabel = 0;
+
+            using SqlConnection con = new(ConnStr);
+            con.Open();
+            string sql = "SELECT Emp_ID, Face_Embedding FROM Employees WHERE Face_Embedding IS NOT NULL";
+            using SqlCommand cmd = new(sql, con);
+            using SqlDataReader rdr = cmd.ExecuteReader();
+            while (rdr.Read())
+            {
+                string empId = rdr.GetString(0);
+                byte[] imgBytes = (byte[])rdr["Face_Embedding"];
+
+                using MemoryStream ms = new(imgBytes);
+                using Bitmap bmp = new(ms);
+                Mat mat = BitmapConverter.ToMat(bmp);
+                Cv2.CvtColor(mat, mat, ColorConversionCodes.BGR2GRAY);
+
+                // ▶ Detect face
+                var faces = faceDetector.DetectMultiScale(mat, 1.2, 5);
+                if (faces.Length == 0)
+                    continue; // Skip image if no face found
+
+                Rect faceRect = faces[0]; // Use the first detected face
+                Mat faceROI = new Mat(mat, faceRect);
+                Cv2.Resize(faceROI, faceROI, new OpenCvSharp.Size(200, 200));
+
+                mats.Add(faceROI);
+                labels.Add(nextLabel);
+                labelToEmpId[nextLabel] = empId;
+                nextLabel++;
+            }
+
+            if (mats.Count > 0)
+                recognizer.Train(mats, labels);
+            else
+                ShowToast("No faces found in the database. Recogniser not trained.");
+        }
+
+        // ───────────────────────────────────────────────
+        //  ▶ Attendance save helper
+        // ───────────────────────────────────────────────
+       
+
+
+        private void SaveAttendance(string empId, Bitmap bmp)
+        {
+            using MemoryStream ms = new();
+            bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+            byte[] imgData = ms.ToArray();
+            try
+            {
+                using SqlConnection con = new(ConnStr);
+                con.Open();
+
+                // Check if attendance for this employee is already recorded today
+              //  string checkQuery = @"
+           // SELECT COUNT(*) 
+          //  FROM Attendance 
+          //  WHERE Emp_ID = @ID 
+           //   AND CAST(Created_Date AS DATE) = CAST(GETDATE() AS DATE)";
+
+             //   using SqlCommand checkCmd = new(checkQuery, con);
+            //    checkCmd.Parameters.AddWithValue("@ID", empId);
+            //    int existingCount = (int)checkCmd.ExecuteScalar();
+
+            //    if (existingCount > 0)
+            //    {
+            //        ShowToast($"Attendance already recorded for {empId} today.");
+            //        return;
+            //    }
+
+                // Insert new attendance record
+                string insertQuery = "INSERT INTO Attendance (Emp_ID, Face_Embedding) VALUES (@ID, @Img)";
+                using SqlCommand insertCmd = new(insertQuery, con);
+                insertCmd.Parameters.AddWithValue("@ID", empId);
+                insertCmd.Parameters.AddWithValue("@Img", imgData);
+              //  insertCmd.Parameters.AddWithValue("@Time", DateTime.Now);
+                insertCmd.ExecuteNonQuery();
+
+                ShowToast($"Attendance recorded for {empId}.");
+            }
+            catch (Exception ex)
+            {
+                ShowToast($"Database error: {ex.Message}");
+            }
+        }
+
+
+
+
+
+        // ───────────────────────────────────────────────
+        //  ▶ UI buttons
+        // ───────────────────────────────────────────────
+        private void button1_Click(object sender, EventArgs e)
+        {
+            //  StartCamera();
+            ShowToast("Camera Started");
+        }
+
+        private void button2_Click(object sender, EventArgs e)
+        {
+
+            // Capture frame to pictureBox2 for verification / debug
+            if (pictureBox1.Image == null)
+            {
+                ShowToast("No frame captured yet.");
+                return;
+            }
+
+            pictureBox2.Image?.Dispose();
+            pictureBox2.Image = (Bitmap)pictureBox1.Image.Clone();
+            ShowToast("Image Captured");
+        }
+
+        private void button3_Click(object sender, EventArgs e)
+        {
+            if (pictureBox2.Image == null)
+            {
+                ShowToast("Capture an image first.");
+                return;
+            }
+
+            using Bitmap capturedBmp = new(pictureBox2.Image);
+            Mat capturedMat = BitmapConverter.ToMat(capturedBmp);
+            Cv2.CvtColor(capturedMat, capturedMat, ColorConversionCodes.BGR2GRAY);
+
+            recognizer.Predict(capturedMat, out int label, out double confidence);
+
+            // Lower confidence -> better match
+            if (labelToEmpId.ContainsKey(label) && confidence < 60)
+            {
+                string empId = labelToEmpId[label];
+
+                textBox2.Text = empId; // Auto‑fill ID for the user
+
+                // OPTIONAL: record attendance automatically
+                SaveAttendance(empId, capturedBmp);
+
+                ShowToast($"Match ✓  ID: {empId}  (confidence {confidence:F2})");
+            }
+            else
+            {
+                ShowToast($"Label: {label}, (confidence {confidence:F2})");
+            }
+
+            // Clean up if desired
+            pictureBox2.Image = null;
+            textBox2.Text = "";
+        }
+
+        // ───────────────────────────────────────────────
+        //  ▶ Clean‑up when form closes
+        // ───────────────────────────────────────────────
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (videoCapture?.IsRunning == true)
+            {
+                videoCapture.SignalToStop();
+                videoCapture.NewFrame -= Camera_on;
+                videoCapture = null;
+            }
+            base.OnFormClosing(e);
+        }
+        private void TextBox2_TextChanged(object? sender, EventArgs e)
+
+        {
+            string empId = textBox2.Text.Trim();
+
+            if (string.IsNullOrEmpty(empId) || empId == "Unknown")
+            {
+                attendanceTimer.Stop();
+                lastEmpId = "";
+                return;
+            }
+
+            // If the employee ID changed, reset the timer
+            if (empId != lastEmpId)
+            {
+                lastEmpId = empId;
+                attendanceTimer.Stop();
+                attendanceTimer.Start();
+            }
+            // else same empId, timer keeps running until tick fires
+        }
+
+
+      private void textBox2_TextChanged(object sender, EventArgs e)
+       {
+
+       }
+    }
+}
